@@ -1,15 +1,19 @@
 /**
- * Absence Deductions — Safar Academy Staff Payroll Database
+ * Pay Run tools — Safar Academy Staff Payroll Database
  *
- * Put this script in the PAYROLL DATABASE (Extensions → Apps Script).
- * It adds a "Pay Run" menu. Choose "Fill absence deductions...", type a month,
- * and it will:
- *   1. Read the Staff Attendance Monthly tab of all 5 branch Class Management sheets
- *   2. Build one list, branch by branch: Edmonton, Enfield, Finchley, Harlow, Slough
- *      (Absences = Absent days minus Sick days)
- *   3. Write Name → column D and Absences (Days) → column F of the
- *      "Absence Deduction Calculator" tab, starting at row 15, in that branch order
- *   4. Email you the list with a section and subtotal per branch
+ * Put this script in the PAYROLL DATABASE (Extensions → Apps Script), replacing
+ * the previous absence script. It adds a "Pay Run" menu with two options:
+ *
+ *  1. Fill absence deductions...
+ *     Reads every branch's Staff Attendance Monthly tab, branch by branch
+ *     (Edmonton, Enfield, Finchley, Harlow, Slough). Absences = Absent minus Sick.
+ *     Writes Name → D and Absences (Days) → F on "Absence Deduction Calculator"
+ *     from row 15, then emails you the list.
+ *
+ *  2. Fill mileage days...
+ *     For every name in column B of "Mileage Calculator", finds that person in
+ *     the branch attendance tabs and writes the number of days they were
+ *     PRESENT that month into the days column, then emails you the list.
  */
 
 // ---- Settings ---------------------------------------------------------------
@@ -24,15 +28,24 @@ const BRANCHES = [
 const ATTENDANCE_TAB = 'Staff Attendance Monthly';  // tab in each branch sheet
 const NAME_COLUMN    = 1;                           // column A = Staff List
 
+// Absence Deduction Calculator
 const DEDUCTION_TAB  = 'Absence Deduction Calculator';
 const DED_FIRST_ROW  = 15;  // first data row of the table
 const DED_NO_COL     = 1;   // column A = "No" (used to find where the table ends)
 const DED_NAME_COL   = 4;   // column D = Name
 const DED_DAYS_COL   = 6;   // column F = Absences (Days)
 
+// Mileage Calculator
+const MILEAGE_TAB        = 'Mileage Calculator';
+const MILEAGE_NAME_COL   = 2;  // column B = names
+const MILEAGE_HEADER_ROW = 2;  // row with the "Name" header
+const MILEAGE_FIRST_ROW  = 3;  // only names in rows 3–32 are looked up
+const MILEAGE_LAST_ROW   = 32;
+const MILEAGE_DAYS_COL   = 6;  // column F = Attendance This Period (Days)
+
 const RECIPIENT      = 'faisal@safaracademy.org';
 
-// Staff who are never included (not in the deduction table or the email).
+// Staff never included in the ABSENCE deductions (not in the table or the email).
 const EXCLUDED_STAFF = [
   'Br Qari Zaid Tarapuri',
   'Br Faisal Samdani',
@@ -49,46 +62,19 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Pay Run')
     .addItem('Fill absence deductions...', 'promptAndFillDeductions')
+    .addItem('Fill mileage days...', 'promptAndFillMileage')
     .addToUi();
 }
 
-/** Menu action: ask for month, confirm, fill the table and email the summary. */
-function promptAndFillDeductions() {
-  const ui = SpreadsheetApp.getUi();
-  const res = ui.prompt('Absence deductions', 'Which month? (e.g. September, Oct, Nov)', ui.ButtonSet.OK_CANCEL);
-  if (res.getSelectedButton() !== ui.Button.OK) return;
+// =============================================================================
+// Shared: read one month of attendance from every branch
+// =============================================================================
 
-  try {
-    const monthIdx = parseMonth(res.getResponseText());
-    const report = collectAbsences(monthIdx);
-    const toDeduct = report.rows.filter(r => r.days > 0);
-
-    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DEDUCTION_TAB);
-    if (!sheet) throw new Error('Tab "' + DEDUCTION_TAB + '" not found.');
-    const capacity = tableCapacity(sheet);
-
-    if (toDeduct.length > capacity) {
-      throw new Error(toDeduct.length + ' staff have absences but the table only has ' + capacity +
-                      ' numbered rows (from row ' + DED_FIRST_ROW + '). Add more rows to the table and try again.');
-    }
-
-    let msg = report.monthLabel + ': ' + toDeduct.length + ' staff with absences (sick days excluded).\n\n' +
-              'This will clear and replace the names in column D and days in column F ' +
-              '(rows ' + DED_FIRST_ROW + '–' + (DED_FIRST_ROW + capacity - 1) + '). Continue?';
-    if (report.errors.length) msg += '\n\nWarning — skipped:\n' + report.errors.join('\n');
-    if (ui.alert('Confirm', msg, ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
-
-    writeDeductionTable(sheet, toDeduct, capacity);
-    emailReport(report);
-    ui.alert('Done. ' + toDeduct.length + ' staff added to "' + DEDUCTION_TAB +
-             '" and the summary emailed to ' + RECIPIENT + '.');
-  } catch (e) {
-    ui.alert('Could not complete: ' + e.message);
-  }
-}
-
-/** Reads every branch in order and returns one list, grouped branch by branch. */
-function collectAbsences(monthIdx) {
+/**
+ * Returns { monthLabel, errors, rows: [{branch, name, present, days, comp}] }
+ * where days = Absent minus Sick. Rows are in branch order, then staff-list order.
+ */
+function readAttendance(monthIdx) {
   const abbr = MONTHS[monthIdx];
   const rows = [];
   const errors = [];
@@ -107,8 +93,9 @@ function collectAbsences(monthIdx) {
       const headerIdx = top.findIndex(row => colIn(row, 'absent') !== -1);
       if (headerIdx === -1) throw new Error('no "Absent ' + MONTH_NAMES[monthIdx] + '" column');
       const hdr = top[headerIdx];
-      const absentC = colIn(hdr, 'absent'), sickC = colIn(hdr, 'sick'), compC = colIn(hdr, 'compas');
-      if (sickC === -1 || compC === -1) throw new Error('missing Sick or Compassion column');
+      const presentC = colIn(hdr, 'present'), absentC = colIn(hdr, 'absent'),
+            sickC = colIn(hdr, 'sick'), compC = colIn(hdr, 'compas');
+      if (presentC === -1 || sickC === -1 || compC === -1) throw new Error('missing Present, Sick or Compassion column');
 
       const yr = hdr[absentC].match(/(\d{2,4})\s*$/);
       if (yr) monthLabel = MONTH_NAMES[monthIdx] + ' 20' + yr[1].slice(-2);
@@ -121,12 +108,14 @@ function collectAbsences(monthIdx) {
 
       for (let i = 0; i < n; i++) {
         const name = String(names[i][0]).replace(/\s+/g, ' ').trim();
-        if (!name || isExcluded(name)) continue;
-        const days = Math.max(0, (Number(data[i][absentC]) || 0) - (Number(data[i][sickC]) || 0));
-        const comp = Number(data[i][compC]) || 0;
-        if (days === 0 && comp === 0) continue;
-        // Kept in the same order as the branch's staff list.
-        rows.push({ branch: b.name, name: name, days: days, comp: comp });
+        if (!name) continue;
+        rows.push({
+          branch: b.name,
+          name: name,
+          present: Number(data[i][presentC]) || 0,
+          days: Math.max(0, (Number(data[i][absentC]) || 0) - (Number(data[i][sickC]) || 0)),
+          comp: Number(data[i][compC]) || 0,
+        });
       }
     } catch (e) {
       errors.push(b.name + ': ' + e.message);
@@ -134,6 +123,75 @@ function collectAbsences(monthIdx) {
   });
 
   return { monthLabel: monthLabel, rows: rows, errors: errors };
+}
+
+/**
+ * Shows a pop-up with a month dropdown (defaults to last month).
+ * When you click Run, it calls the given function with the chosen month.
+ */
+function showMonthPicker(title, runFunction) {
+  const last = (new Date().getMonth() + 11) % 12;
+  // Academic year order: September → August.
+  const order = [8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7];
+  const options = order.map(i => '<option value="' + i + '"' + (i === last ? ' selected' : '') + '>' +
+                                 MONTH_NAMES[i] + '</option>').join('');
+  const html =
+    '<div style="font-family:Arial,sans-serif;font-size:14px">' +
+    '<p>Which month do you want to run this for?</p>' +
+    '<select id="m" style="font-size:14px;padding:4px;width:100%">' + options + '</select>' +
+    '<p style="margin-top:16px">' +
+    '<button id="go" style="background:#0b3a40;color:#fff;border:0;padding:8px 16px;border-radius:4px;cursor:pointer">Run</button> ' +
+    '<button onclick="google.script.host.close()" style="padding:8px 16px">Cancel</button></p>' +
+    '<p id="s" style="color:#666"></p></div>' +
+    '<script>document.getElementById("go").onclick=function(){' +
+    'this.disabled=true;document.getElementById("s").textContent="Reading the branch sheets…";' +
+    'google.script.run.withSuccessHandler(function(){google.script.host.close();})' +
+    '.withFailureHandler(function(e){document.getElementById("s").textContent="Error: "+e.message;})' +
+    '.' + runFunction + '(Number(document.getElementById("m").value));};</script>';
+  SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html).setWidth(320).setHeight(190), title);
+}
+
+// =============================================================================
+// 1. Absence deductions
+// =============================================================================
+
+function promptAndFillDeductions() {
+  showMonthPicker('Absence deductions', 'runDeductions');
+}
+
+function runDeductions(monthIdx) {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const att = readAttendance(monthIdx);
+    const report = {
+      monthLabel: att.monthLabel,
+      errors: att.errors,
+      rows: att.rows.filter(r => !isExcluded(r.name) && (r.days > 0 || r.comp > 0)),
+    };
+    const toDeduct = report.rows.filter(r => r.days > 0);
+
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DEDUCTION_TAB);
+    if (!sheet) throw new Error('Tab "' + DEDUCTION_TAB + '" not found.');
+    const capacity = tableCapacity(sheet);
+
+    if (toDeduct.length > capacity) {
+      throw new Error(toDeduct.length + ' staff have absences but the table only has ' + capacity +
+                      ' numbered rows (from row ' + DED_FIRST_ROW + '). Add more rows to the table and try again.');
+    }
+
+    let msg = report.monthLabel + ': ' + toDeduct.length + ' staff with absences (sick days excluded).\n\n' +
+              'This will clear and replace the names in column D and days in column F ' +
+              '(rows ' + DED_FIRST_ROW + '–' + (DED_FIRST_ROW + capacity - 1) + '). Continue?';
+    if (report.errors.length) msg += '\n\nWarning — skipped:\n' + report.errors.join('\n');
+    if (ui.alert('Confirm', msg, ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+
+    writeDeductionTable(sheet, toDeduct, capacity);
+    emailAbsenceReport(report);
+    ui.alert('Done. ' + toDeduct.length + ' staff added to "' + DEDUCTION_TAB +
+             '" and the summary emailed to ' + RECIPIENT + '.');
+  } catch (e) {
+    ui.alert('Could not complete: ' + e.message);
+  }
 }
 
 /** Number of numbered rows in the table (column A filled from row 15 down). */
@@ -154,73 +212,201 @@ function writeDeductionTable(sheet, rows, capacity) {
   sheet.getRange(DED_FIRST_ROW, DED_DAYS_COL, rows.length, 1).setValues(rows.map(r => [r.days]));
 }
 
-/** Emails the consolidated table. */
-function emailReport(report) {
+function emailAbsenceReport(report) {
+  const intro = 'Staff absences for <b>' + report.monthLabel + '</b>, all branches. ' +
+                'Sick days are excluded from the Absences count. Staff with absences have been added to the ' +
+                esc(DEDUCTION_TAB) + '.';
+  sendBranchEmail(
+    'Staff absences — ' + report.monthLabel + ' (' + report.rows.length + ' staff, all branches)',
+    intro, report,
+    [{ label: 'Absences', key: 'days' }, { label: 'Compassion', key: 'comp' }]
+  );
+}
+
+// =============================================================================
+// 2. Mileage days
+// =============================================================================
+
+function promptAndFillMileage() {
+  showMonthPicker('Mileage days', 'runMileage');
+}
+
+function runMileage(monthIdx) {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(MILEAGE_TAB);
+    if (!sheet) throw new Error('Tab "' + MILEAGE_TAB + '" not found.');
+    const layout = findMileageLayout(sheet);
+
+    // Look up present days from the branch attendance tabs.
+    const att = readAttendance(monthIdx);
+    const lookup = {};
+    att.rows.forEach(r => {
+      const k = nameKey(r.name);
+      if (!lookup[k]) lookup[k] = { present: 0, branches: [] };
+      lookup[k].present += r.present;
+      lookup[k].branches.push(r.branch);
+    });
+
+    // Match each name in column B — rows 3 to 32 only.
+    const firstRow = MILEAGE_FIRST_ROW;
+    const n = MILEAGE_LAST_ROW - MILEAGE_FIRST_ROW + 1;
+    const names = sheet.getRange(firstRow, MILEAGE_NAME_COL, n, 1).getDisplayValues();
+
+    const matched = [], notFound = [];
+    for (let i = 0; i < n; i++) {
+      const name = String(names[i][0]).replace(/\s+/g, ' ').trim();
+      if (!name) continue;
+      const hit = lookup[nameKey(name)];
+      if (hit) matched.push({ row: firstRow + i, name: name, present: hit.present, branches: hit.branches });
+      else notFound.push(name);
+    }
+
+    const colLetter = columnLetter(layout.daysCol);
+    let msg = att.monthLabel + ': found ' + matched.length + ' of ' + (matched.length + notFound.length) +
+              ' names in column B (rows ' + MILEAGE_FIRST_ROW + '–' + MILEAGE_LAST_ROW + ').\n\nDays present will be written to column ' + colLetter +
+              ' ("' + layout.daysHeader + '"). Names not found are left unchanged. Continue?';
+    if (notFound.length) msg += '\n\nNot found:\n' + notFound.join('\n');
+    if (att.errors.length) msg += '\n\nWarning — skipped:\n' + att.errors.join('\n');
+    if (ui.alert('Confirm', msg, ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+
+    matched.forEach(m => sheet.getRange(m.row, layout.daysCol).setValue(m.present));
+    emailMileageReport(att, matched, notFound);
+    ui.alert('Done. Days present filled for ' + matched.length + ' staff in "' + MILEAGE_TAB +
+             '" and the list emailed to ' + RECIPIENT + '.');
+  } catch (e) {
+    ui.alert('Could not complete: ' + e.message);
+  }
+}
+
+/** Works out the header row and the "days" column on the Mileage Calculator tab. */
+function findMileageLayout(sheet) {
+  const scanRows = Math.min(30, sheet.getLastRow());
+  const top = sheet.getRange(1, 1, scanRows, sheet.getLastColumn()).getDisplayValues()
+                   .map(r => r.map(h => String(h).replace(/\s+/g, ' ').trim()));
+
+  let headerRow = MILEAGE_HEADER_ROW;
+  if (!headerRow) {
+    const idx = top.findIndex(r => /^name$/i.test(r[MILEAGE_NAME_COL - 1] || ''));
+    if (idx === -1) throw new Error('Could not find the "Name" header in column B on "' + MILEAGE_TAB +
+                                    '". Set MILEAGE_HEADER_ROW at the top of the script.');
+    headerRow = idx + 1;
+  }
+  const hdr = top[headerRow - 1] || [];
+  let daysCol = MILEAGE_DAYS_COL;
+  if (!daysCol) {
+    const c = hdr.findIndex(h => /days/i.test(h));
+    if (c === -1) throw new Error('No "days" column in row ' + headerRow + '. Set MILEAGE_DAYS_COL at the top of the script.');
+    daysCol = c + 1;
+  }
+  return { headerRow: headerRow, daysCol: daysCol, daysHeader: hdr[daysCol - 1] || '' };
+}
+
+function emailMileageReport(att, matched, notFound) {
+  // Only the people on the Mileage Calculator — not the whole staff list.
+  const wanted = {};
+  matched.forEach(m => wanted[nameKey(m.name)] = true);
+  const report = {
+    monthLabel: att.monthLabel,
+    errors: att.errors,
+    // One row per branch so each branch section shows its own days.
+    rows: att.rows.filter(r => wanted[nameKey(r.name)]),
+  };
+  let intro = 'Days present for <b>' + att.monthLabel + '</b> for everyone on the ' + esc(MILEAGE_TAB) +
+              '. These have been entered into the ' + esc(MILEAGE_TAB) + ' tab.';
+  if (notFound.length) {
+    intro += '<br><span style="color:#b00"><b>Not found in any branch (left unchanged):</b> ' +
+             notFound.map(esc).join(', ') + '</span>';
+  }
+  sendBranchEmail(
+    'Mileage days present — ' + att.monthLabel + ' (' + matched.length + ' staff)',
+    intro, report,
+    [{ label: 'Days present', key: 'present' }],
+    notFound
+  );
+}
+
+// =============================================================================
+// Shared email builder: one table, a section and subtotal per branch
+// =============================================================================
+
+function sendBranchEmail(subject, introHtml, report, cols, notFound) {
   const rows = report.rows;
-  const total = rows.reduce((s, r) => s + r.days, 0);
-  const totalComp = rows.reduce((s, r) => s + r.comp, 0);
   const th = 'style="border:1px solid #ccc;padding:6px 10px;background:#0b3a40;color:#fff;text-align:left"';
   const td = 'style="border:1px solid #ccc;padding:6px 10px"';
+  const bh = 'style="border:1px solid #ccc;padding:6px 10px;background:#e6eef0;font-weight:bold"';
+  const span = cols.length + 1;
+  const sum = (list, key) => list.reduce((s, r) => s + r[key], 0);
 
-  let html = '<p>Staff absences for <b>' + report.monthLabel + '</b>, all branches. ' +
-             'Sick days are excluded from the Absences count. Staff with absences have been added to the ' +
-             esc(DEDUCTION_TAB) + '.</p>';
+  let html = '<p>' + introHtml + '</p>';
   if (report.errors.length) {
     html += '<p style="color:#b00"><b>Skipped:</b> ' + report.errors.map(esc).join('; ') + '</p>';
   }
-  const bh = 'style="border:1px solid #ccc;padding:6px 10px;background:#e6eef0;font-weight:bold"';
   let plain = '';
 
   if (!rows.length) {
-    html += '<p>No absences recorded.</p>';
-    plain = 'No absences recorded.';
+    html += '<p>Nothing to report.</p>';
+    plain = 'Nothing to report.';
   } else {
-    html += '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px"><tr>' +
-            '<th ' + th + '>Name</th><th ' + th + '>Absences</th><th ' + th + '>Compassion</th></tr>';
+    html += '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px"><tr><th ' + th + '>Name</th>' +
+            cols.map(c => '<th ' + th + '>' + c.label + '</th>').join('') + '</tr>';
 
     BRANCHES.forEach(b => {
       const br = rows.filter(r => r.branch === b.name);
-      const bDays = br.reduce((s, r) => s + r.days, 0);
-      const bComp = br.reduce((s, r) => s + r.comp, 0);
-
-      html += '<tr><td ' + bh + ' colspan="3">' + esc(b.name) + '</td></tr>';
+      html += '<tr><td ' + bh + ' colspan="' + span + '">' + esc(b.name) + '</td></tr>';
       plain += '\n' + b.name.toUpperCase() + '\n';
       if (!br.length) {
         const skipped = report.errors.some(e => e.indexOf(b.name + ':') === 0);
-        const note = skipped ? 'Not read: see warning above' : 'No absences';
-        html += '<tr><td ' + td + ' colspan="3" style="color:' + (skipped ? '#b00' : '#888') + '">' + note + '</td></tr>';
+        const note = skipped ? 'Not read: see warning above' : 'None';
+        html += '<tr><td ' + td + ' colspan="' + span + '" style="color:' + (skipped ? '#b00' : '#888') + '">' + note + '</td></tr>';
         plain += '  ' + note + '\n';
         return;
       }
       br.forEach(r => {
-        html += '<tr><td ' + td + '>' + esc(r.name) + '</td><td ' + td + ' align="center">' + r.days +
-                '</td><td ' + td + ' align="center">' + r.comp + '</td></tr>';
-        plain += '  ' + r.name + ' | ' + r.days + ' | ' + r.comp + '\n';
+        html += '<tr><td ' + td + '>' + esc(r.name) + '</td>' +
+                cols.map(c => '<td ' + td + ' align="center">' + r[c.key] + '</td>').join('') + '</tr>';
+        plain += '  ' + r.name + ' | ' + cols.map(c => r[c.key]).join(' | ') + '\n';
       });
-      html += '<tr><td ' + td + '><i>' + esc(b.name) + ' subtotal</i></td><td ' + td + ' align="center"><i>' + bDays +
-              '</i></td><td ' + td + ' align="center"><i>' + bComp + '</i></td></tr>';
-      plain += '  Subtotal | ' + bDays + ' | ' + bComp + '\n';
+      html += '<tr><td ' + td + '><i>' + esc(b.name) + ' subtotal</i></td>' +
+              cols.map(c => '<td ' + td + ' align="center"><i>' + sum(br, c.key) + '</i></td>').join('') + '</tr>';
+      plain += '  Subtotal | ' + cols.map(c => sum(br, c.key)).join(' | ') + '\n';
     });
 
-    html += '<tr><td ' + td + '><b>Total (all branches)</b></td><td ' + td + ' align="center"><b>' + total +
-            '</b></td><td ' + td + ' align="center"><b>' + totalComp + '</b></td></tr></table>';
-    plain = 'Name | Absences | Compassion\n' + plain + '\nTotal (all branches) | ' + total + ' | ' + totalComp;
+    html += '<tr><td ' + td + '><b>Total (all branches)</b></td>' +
+            cols.map(c => '<td ' + td + ' align="center"><b>' + sum(rows, c.key) + '</b></td>').join('') + '</tr></table>';
+    plain = 'Name | ' + cols.map(c => c.label).join(' | ') + '\n' + plain +
+            '\nTotal (all branches) | ' + cols.map(c => sum(rows, c.key)).join(' | ');
   }
+  if (notFound && notFound.length) plain += '\n\nNot found (left unchanged): ' + notFound.join(', ');
   if (report.errors.length) plain += '\n\nSkipped: ' + report.errors.join('; ');
 
-  MailApp.sendEmail({
-    to: RECIPIENT,
-    subject: 'Staff absences — ' + report.monthLabel + ' (' + rows.length + ' staff, all branches)',
-    body: plain,
-    htmlBody: html,
-  });
+  html += '<p style="color:#888;font-size:11px">Generated from ' +
+          esc(SpreadsheetApp.getActiveSpreadsheet().getName()) + ' on ' + new Date().toLocaleDateString('en-GB') + '.</p>';
+
+  MailApp.sendEmail({ to: RECIPIENT, subject: subject, body: plain, htmlBody: html });
 }
 
-/** True if the name is on the exclusion list (ignores case, extra spaces and Br/Sr/Qari titles). */
+// =============================================================================
+// Helpers
+// =============================================================================
+
+/** Name key that ignores case, spacing, titles and word order ("Sr Naushen Ishrat" = "Ishrat Naushen"). */
+function nameKey(s) {
+  return String(s).toLowerCase()
+    .replace(/\b(br|sr|qari)\b\.?/g, ' ')
+    .replace(/[^a-z\s-]/g, ' ')
+    .split(/\s+/).filter(Boolean).sort().join(' ');
+}
+
 function isExcluded(name) {
-  const norm = s => String(s).toLowerCase().replace(/\b(br|sr|qari)\b\.?/g, '').replace(/\s+/g, ' ').trim();
-  const n = norm(name);
-  return EXCLUDED_STAFF.some(x => norm(x) === n);
+  const k = nameKey(name);
+  return EXCLUDED_STAFF.some(x => nameKey(x) === k);
+}
+
+function columnLetter(col) {
+  let s = '';
+  while (col > 0) { const m = (col - 1) % 26; s = String.fromCharCode(65 + m) + s; col = Math.floor((col - 1) / 26); }
+  return s;
 }
 
 function parseMonth(input) {
