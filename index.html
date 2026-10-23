@@ -1,0 +1,217 @@
+/**
+ * Absence Deductions — Safar Academy Staff Payroll Database
+ *
+ * Put this script in the PAYROLL DATABASE (Extensions → Apps Script).
+ * It adds a "Pay Run" menu. Choose "Fill absence deductions...", type a month,
+ * and it will:
+ *   1. Read the Staff Attendance Monthly tab of all 5 branch Class Management sheets
+ *   2. Combine them into one list (Absences = Absent days minus Sick days)
+ *   3. Write Name → column D and Absences (Days) → column F of the
+ *      "Absence Deduction Calculator" tab, starting at row 15
+ *   4. Email you the consolidated table (Branch, Name, Absences, Compassion)
+ */
+
+// ---- Settings ---------------------------------------------------------------
+const BRANCHES = [
+  { code: 'ED', id: '1sNvj_gHKFXhoa57XKQIIywGxfzJksGSeQRRnjboXbco' },
+  { code: 'EN', id: '11kPb0BhOn1lPzzEU5g_CIZWiPemqiGihQ211vgaxg50' },
+  { code: 'FN', id: '1_bQoYY3JVh8XEd3TNaCuJsz5qlSZHktCyibUvpp23eY' },
+  { code: 'HL', id: '1Av2eNmA7qSyvY_y5QVxHUjZdrzFXiE5tE4-Lc-viHsE' },
+  { code: 'SL', id: '1e4ZHaYmV_Xo_AtSJtONT-gEYlyJyffcKmZBh_yYWeU8' },
+];
+const ATTENDANCE_TAB = 'Staff Attendance Monthly';  // tab in each branch sheet
+const NAME_COLUMN    = 1;                           // column A = Staff List
+
+const DEDUCTION_TAB  = 'Absence Deduction Calculator';
+const DED_FIRST_ROW  = 15;  // first data row of the table
+const DED_NO_COL     = 1;   // column A = "No" (used to find where the table ends)
+const DED_NAME_COL   = 4;   // column D = Name
+const DED_DAYS_COL   = 6;   // column F = Absences (Days)
+
+const RECIPIENT      = 'faisal@safaracademy.org';
+
+// Staff who are never included (not in the deduction table or the email).
+const EXCLUDED_STAFF = [
+  'Br Qari Zaid Tarapuri',
+  'Br Faisal Samdani',
+  'Br Amjad Shaikh',
+];
+// -----------------------------------------------------------------------------
+
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun',
+                'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June',
+                     'July', 'August', 'September', 'October', 'November', 'December'];
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Pay Run')
+    .addItem('Fill absence deductions...', 'promptAndFillDeductions')
+    .addToUi();
+}
+
+/** Menu action: ask for month, confirm, fill the table and email the summary. */
+function promptAndFillDeductions() {
+  const ui = SpreadsheetApp.getUi();
+  const res = ui.prompt('Absence deductions', 'Which month? (e.g. September, Oct, Nov)', ui.ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+
+  try {
+    const monthIdx = parseMonth(res.getResponseText());
+    const report = collectAbsences(monthIdx);
+    const toDeduct = report.rows.filter(r => r.days > 0);
+
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DEDUCTION_TAB);
+    if (!sheet) throw new Error('Tab "' + DEDUCTION_TAB + '" not found.');
+    const capacity = tableCapacity(sheet);
+
+    if (toDeduct.length > capacity) {
+      throw new Error(toDeduct.length + ' staff have absences but the table only has ' + capacity +
+                      ' numbered rows (from row ' + DED_FIRST_ROW + '). Add more rows to the table and try again.');
+    }
+
+    let msg = report.monthLabel + ': ' + toDeduct.length + ' staff with absences (sick days excluded).\n\n' +
+              'This will clear and replace the names in column D and days in column F ' +
+              '(rows ' + DED_FIRST_ROW + '–' + (DED_FIRST_ROW + capacity - 1) + '). Continue?';
+    if (report.errors.length) msg += '\n\nWarning — skipped:\n' + report.errors.join('\n');
+    if (ui.alert('Confirm', msg, ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+
+    writeDeductionTable(sheet, toDeduct, capacity);
+    emailReport(report);
+    ui.alert('Done. ' + toDeduct.length + ' staff added to "' + DEDUCTION_TAB +
+             '" and the summary emailed to ' + RECIPIENT + '.');
+  } catch (e) {
+    ui.alert('Could not complete: ' + e.message);
+  }
+}
+
+/** Reads every branch and returns one combined list. */
+function collectAbsences(monthIdx) {
+  const abbr = MONTHS[monthIdx];
+  const byName = {};
+  const errors = [];
+  let monthLabel = MONTH_NAMES[monthIdx];
+
+  BRANCHES.forEach(b => {
+    try {
+      const sheet = SpreadsheetApp.openById(b.id).getSheetByName(ATTENDANCE_TAB);
+      if (!sheet) throw new Error('no "' + ATTENDANCE_TAB + '" tab');
+
+      // Find the header row (the one with "Absent <Mon>") within the top 10 rows.
+      const top = sheet.getRange(1, 1, Math.min(10, sheet.getLastRow()), sheet.getLastColumn())
+                       .getDisplayValues()
+                       .map(r => r.map(h => String(h).replace(/\s+/g, ' ').trim()));
+      const colIn = (row, prefix) => row.findIndex(h => new RegExp('^' + prefix + '.*\\b' + abbr + '\\b', 'i').test(h));
+      const headerIdx = top.findIndex(row => colIn(row, 'absent') !== -1);
+      if (headerIdx === -1) throw new Error('no "Absent ' + MONTH_NAMES[monthIdx] + '" column');
+      const hdr = top[headerIdx];
+      const absentC = colIn(hdr, 'absent'), sickC = colIn(hdr, 'sick'), compC = colIn(hdr, 'compas');
+      if (sickC === -1 || compC === -1) throw new Error('missing Sick or Compassion column');
+
+      const yr = hdr[absentC].match(/(\d{2,4})\s*$/);
+      if (yr) monthLabel = MONTH_NAMES[monthIdx] + ' 20' + yr[1].slice(-2);
+
+      const firstRow = headerIdx + 2; // row after the header
+      const n = sheet.getLastRow() - firstRow + 1;
+      if (n < 1) return;
+      const data = sheet.getRange(firstRow, 1, n, sheet.getLastColumn()).getValues();
+      const names = sheet.getRange(firstRow, NAME_COLUMN, n, 1).getDisplayValues();
+
+      for (let i = 0; i < n; i++) {
+        const name = String(names[i][0]).replace(/\s+/g, ' ').trim();
+        if (!name || isExcluded(name)) continue;
+        const days = Math.max(0, (Number(data[i][absentC]) || 0) - (Number(data[i][sickC]) || 0));
+        const comp = Number(data[i][compC]) || 0;
+        if (days === 0 && comp === 0) continue;
+        const key = name.toLowerCase();
+        if (!byName[key]) byName[key] = { name: name, branches: [], days: 0, comp: 0 };
+        byName[key].days += days;
+        byName[key].comp += comp;
+        if (byName[key].branches.indexOf(b.code) === -1) byName[key].branches.push(b.code);
+      }
+    } catch (e) {
+      errors.push(b.code + ': ' + e.message);
+    }
+  });
+
+  const rows = Object.keys(byName).map(k => byName[k])
+    .sort((a, b) => b.days - a.days || a.name.localeCompare(b.name));
+  return { monthLabel: monthLabel, rows: rows, errors: errors };
+}
+
+/** Number of numbered rows in the table (column A filled from row 15 down). */
+function tableCapacity(sheet) {
+  const maxRows = sheet.getMaxRows() - DED_FIRST_ROW + 1;
+  const col = sheet.getRange(DED_FIRST_ROW, DED_NO_COL, maxRows, 1).getValues();
+  let count = 0;
+  while (count < col.length && col[count][0] !== '' && !isNaN(Number(col[count][0]))) count++;
+  return count;
+}
+
+/** Clears columns D and F in the table, then writes the new names and days. */
+function writeDeductionTable(sheet, rows, capacity) {
+  sheet.getRange(DED_FIRST_ROW, DED_NAME_COL, capacity, 1).clearContent();
+  sheet.getRange(DED_FIRST_ROW, DED_DAYS_COL, capacity, 1).clearContent();
+  if (!rows.length) return;
+  sheet.getRange(DED_FIRST_ROW, DED_NAME_COL, rows.length, 1).setValues(rows.map(r => [r.name]));
+  sheet.getRange(DED_FIRST_ROW, DED_DAYS_COL, rows.length, 1).setValues(rows.map(r => [r.days]));
+}
+
+/** Emails the consolidated table. */
+function emailReport(report) {
+  const rows = report.rows;
+  const total = rows.reduce((s, r) => s + r.days, 0);
+  const totalComp = rows.reduce((s, r) => s + r.comp, 0);
+  const th = 'style="border:1px solid #ccc;padding:6px 10px;background:#0b3a40;color:#fff;text-align:left"';
+  const td = 'style="border:1px solid #ccc;padding:6px 10px"';
+
+  let html = '<p>Staff absences for <b>' + report.monthLabel + '</b>, all branches. ' +
+             'Sick days are excluded from the Absences count. Staff with absences have been added to the ' +
+             esc(DEDUCTION_TAB) + '.</p>';
+  if (report.errors.length) {
+    html += '<p style="color:#b00"><b>Skipped:</b> ' + report.errors.map(esc).join('; ') + '</p>';
+  }
+  if (!rows.length) {
+    html += '<p>No absences recorded.</p>';
+  } else {
+    html += '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px"><tr>' +
+            '<th ' + th + '>Branch</th><th ' + th + '>Name</th><th ' + th + '>Absences</th><th ' + th + '>Compassion</th></tr>';
+    rows.forEach(r => {
+      html += '<tr><td ' + td + '>' + r.branches.join(', ') + '</td><td ' + td + '>' + esc(r.name) +
+              '</td><td ' + td + ' align="center">' + r.days + '</td><td ' + td + ' align="center">' + r.comp + '</td></tr>';
+    });
+    html += '<tr><td ' + td + '></td><td ' + td + '><b>Total</b></td><td ' + td + ' align="center"><b>' + total +
+            '</b></td><td ' + td + ' align="center"><b>' + totalComp + '</b></td></tr></table>';
+  }
+
+  const plain = 'Branch | Name | Absences | Compassion\n' +
+    rows.map(r => r.branches.join(', ') + ' | ' + r.name + ' | ' + r.days + ' | ' + r.comp).join('\n') +
+    '\nTotal | | ' + total + ' | ' + totalComp +
+    (report.errors.length ? '\n\nSkipped: ' + report.errors.join('; ') : '');
+
+  MailApp.sendEmail({
+    to: RECIPIENT,
+    subject: 'Staff absences — ' + report.monthLabel + ' (' + rows.length + ' staff, all branches)',
+    body: plain,
+    htmlBody: html,
+  });
+}
+
+/** True if the name is on the exclusion list (ignores case, extra spaces and Br/Sr/Qari titles). */
+function isExcluded(name) {
+  const norm = s => String(s).toLowerCase().replace(/\b(br|sr|qari)\b\.?/g, '').replace(/\s+/g, ' ').trim();
+  const n = norm(name);
+  return EXCLUDED_STAFF.some(x => norm(x) === n);
+}
+
+function parseMonth(input) {
+  const s = String(input || '').trim().toLowerCase();
+  if (/^\d{1,2}$/.test(s) && +s >= 1 && +s <= 12) return +s - 1;
+  const idx = MONTHS.indexOf(s.slice(0, 3));
+  if (idx === -1) throw new Error('"' + input + '" is not a month I recognise.');
+  return idx;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
