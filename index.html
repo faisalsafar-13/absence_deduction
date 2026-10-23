@@ -5,19 +5,21 @@
  * It adds a "Pay Run" menu. Choose "Fill absence deductions...", type a month,
  * and it will:
  *   1. Read the Staff Attendance Monthly tab of all 5 branch Class Management sheets
- *   2. Combine them into one list (Absences = Absent days minus Sick days)
+ *   2. Build one list, branch by branch: Edmonton, Enfield, Finchley, Harlow, Slough
+ *      (Absences = Absent days minus Sick days)
  *   3. Write Name → column D and Absences (Days) → column F of the
- *      "Absence Deduction Calculator" tab, starting at row 15
- *   4. Email you the consolidated table (Branch, Name, Absences, Compassion)
+ *      "Absence Deduction Calculator" tab, starting at row 15, in that branch order
+ *   4. Email you the list with a section and subtotal per branch
  */
 
 // ---- Settings ---------------------------------------------------------------
+// Branches are processed, listed and written to payroll in this order.
 const BRANCHES = [
-  { code: 'ED', id: '1sNvj_gHKFXhoa57XKQIIywGxfzJksGSeQRRnjboXbco' },
-  { code: 'EN', id: '11kPb0BhOn1lPzzEU5g_CIZWiPemqiGihQ211vgaxg50' },
-  { code: 'FN', id: '1_bQoYY3JVh8XEd3TNaCuJsz5qlSZHktCyibUvpp23eY' },
-  { code: 'HL', id: '1Av2eNmA7qSyvY_y5QVxHUjZdrzFXiE5tE4-Lc-viHsE' },
-  { code: 'SL', id: '1e4ZHaYmV_Xo_AtSJtONT-gEYlyJyffcKmZBh_yYWeU8' },
+  { name: 'Edmonton', id: '1sNvj_gHKFXhoa57XKQIIywGxfzJksGSeQRRnjboXbco' },
+  { name: 'Enfield',  id: '11kPb0BhOn1lPzzEU5g_CIZWiPemqiGihQ211vgaxg50' },
+  { name: 'Finchley', id: '1_bQoYY3JVh8XEd3TNaCuJsz5qlSZHktCyibUvpp23eY' },
+  { name: 'Harlow',   id: '1Av2eNmA7qSyvY_y5QVxHUjZdrzFXiE5tE4-Lc-viHsE' },
+  { name: 'Slough',   id: '1e4ZHaYmV_Xo_AtSJtONT-gEYlyJyffcKmZBh_yYWeU8' },
 ];
 const ATTENDANCE_TAB = 'Staff Attendance Monthly';  // tab in each branch sheet
 const NAME_COLUMN    = 1;                           // column A = Staff List
@@ -85,10 +87,10 @@ function promptAndFillDeductions() {
   }
 }
 
-/** Reads every branch and returns one combined list. */
+/** Reads every branch in order and returns one list, grouped branch by branch. */
 function collectAbsences(monthIdx) {
   const abbr = MONTHS[monthIdx];
-  const byName = {};
+  const rows = [];
   const errors = [];
   let monthLabel = MONTH_NAMES[monthIdx];
 
@@ -123,19 +125,14 @@ function collectAbsences(monthIdx) {
         const days = Math.max(0, (Number(data[i][absentC]) || 0) - (Number(data[i][sickC]) || 0));
         const comp = Number(data[i][compC]) || 0;
         if (days === 0 && comp === 0) continue;
-        const key = name.toLowerCase();
-        if (!byName[key]) byName[key] = { name: name, branches: [], days: 0, comp: 0 };
-        byName[key].days += days;
-        byName[key].comp += comp;
-        if (byName[key].branches.indexOf(b.code) === -1) byName[key].branches.push(b.code);
+        // Kept in the same order as the branch's staff list.
+        rows.push({ branch: b.name, name: name, days: days, comp: comp });
       }
     } catch (e) {
-      errors.push(b.code + ': ' + e.message);
+      errors.push(b.name + ': ' + e.message);
     }
   });
 
-  const rows = Object.keys(byName).map(k => byName[k])
-    .sort((a, b) => b.days - a.days || a.name.localeCompare(b.name));
   return { monthLabel: monthLabel, rows: rows, errors: errors };
 }
 
@@ -171,23 +168,45 @@ function emailReport(report) {
   if (report.errors.length) {
     html += '<p style="color:#b00"><b>Skipped:</b> ' + report.errors.map(esc).join('; ') + '</p>';
   }
+  const bh = 'style="border:1px solid #ccc;padding:6px 10px;background:#e6eef0;font-weight:bold"';
+  let plain = '';
+
   if (!rows.length) {
     html += '<p>No absences recorded.</p>';
+    plain = 'No absences recorded.';
   } else {
     html += '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px"><tr>' +
-            '<th ' + th + '>Branch</th><th ' + th + '>Name</th><th ' + th + '>Absences</th><th ' + th + '>Compassion</th></tr>';
-    rows.forEach(r => {
-      html += '<tr><td ' + td + '>' + r.branches.join(', ') + '</td><td ' + td + '>' + esc(r.name) +
-              '</td><td ' + td + ' align="center">' + r.days + '</td><td ' + td + ' align="center">' + r.comp + '</td></tr>';
-    });
-    html += '<tr><td ' + td + '></td><td ' + td + '><b>Total</b></td><td ' + td + ' align="center"><b>' + total +
-            '</b></td><td ' + td + ' align="center"><b>' + totalComp + '</b></td></tr></table>';
-  }
+            '<th ' + th + '>Name</th><th ' + th + '>Absences</th><th ' + th + '>Compassion</th></tr>';
 
-  const plain = 'Branch | Name | Absences | Compassion\n' +
-    rows.map(r => r.branches.join(', ') + ' | ' + r.name + ' | ' + r.days + ' | ' + r.comp).join('\n') +
-    '\nTotal | | ' + total + ' | ' + totalComp +
-    (report.errors.length ? '\n\nSkipped: ' + report.errors.join('; ') : '');
+    BRANCHES.forEach(b => {
+      const br = rows.filter(r => r.branch === b.name);
+      const bDays = br.reduce((s, r) => s + r.days, 0);
+      const bComp = br.reduce((s, r) => s + r.comp, 0);
+
+      html += '<tr><td ' + bh + ' colspan="3">' + esc(b.name) + '</td></tr>';
+      plain += '\n' + b.name.toUpperCase() + '\n';
+      if (!br.length) {
+        const skipped = report.errors.some(e => e.indexOf(b.name + ':') === 0);
+        const note = skipped ? 'Not read: see warning above' : 'No absences';
+        html += '<tr><td ' + td + ' colspan="3" style="color:' + (skipped ? '#b00' : '#888') + '">' + note + '</td></tr>';
+        plain += '  ' + note + '\n';
+        return;
+      }
+      br.forEach(r => {
+        html += '<tr><td ' + td + '>' + esc(r.name) + '</td><td ' + td + ' align="center">' + r.days +
+                '</td><td ' + td + ' align="center">' + r.comp + '</td></tr>';
+        plain += '  ' + r.name + ' | ' + r.days + ' | ' + r.comp + '\n';
+      });
+      html += '<tr><td ' + td + '><i>' + esc(b.name) + ' subtotal</i></td><td ' + td + ' align="center"><i>' + bDays +
+              '</i></td><td ' + td + ' align="center"><i>' + bComp + '</i></td></tr>';
+      plain += '  Subtotal | ' + bDays + ' | ' + bComp + '\n';
+    });
+
+    html += '<tr><td ' + td + '><b>Total (all branches)</b></td><td ' + td + ' align="center"><b>' + total +
+            '</b></td><td ' + td + ' align="center"><b>' + totalComp + '</b></td></tr></table>';
+    plain = 'Name | Absences | Compassion\n' + plain + '\nTotal (all branches) | ' + total + ' | ' + totalComp;
+  }
+  if (report.errors.length) plain += '\n\nSkipped: ' + report.errors.join('; ');
 
   MailApp.sendEmail({
     to: RECIPIENT,
